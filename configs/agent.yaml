@@ -1,0 +1,59 @@
+# Marketing Agent Configuration
+# See docs in the architecture plan for component breakdown
+
+# LLM models
+models:
+  orchestrator: claude-sonnet-4-6  # Main reasoning loop
+  subagent: claude-sonnet-4-6      # Scoped child tasks
+  classifier: claude-haiku-4-5-20251001  # Fan-out classification
+
+# Token budgets
+tokens:
+  max_context: 180000        # Max tokens in context window
+  max_output: 8192           # Max output tokens per turn
+  compaction_threshold: 120000  # Trigger compaction at this level
+  summary_target: 4000       # Target size for compacted summary
+
+# BigQuery (reuses project settings)
+bigquery:
+  project: ${BQ_PROJECT:-auxia-reporting}
+  dataset: ${BQ_DATASET:-temp_holley_v5_17}
+  location: US
+  max_bytes_billed: 10737418240  # 10 GB safety limit
+
+# GCS persistence
+gcs:
+  bucket: ${GCS_BUCKET:-holley-models-dev}
+  session_prefix: agent/sessions/
+  artifact_prefix: agent/artifacts/
+  memory_prefix: agent/memory/
+
+# Agent behavior
+agent:
+  max_turns: 50              # Max ReAct loop iterations
+  max_plan_steps: 20         # Max steps in a plan
+  checkpoint_interval: 5     # Checkpoint to GCS every N turns
+  enable_subagents: true
+  enable_fan_out: true
+  fan_out_max_parallel: 20   # Max concurrent Haiku classifiers
+
+# Domain context injected into system prompt
+domain:
+  company: Holley
+  domain: vehicle fitment recommendations
+  description: >
+    Automotive parts recommendation system using collaborative filtering
+    and vehicle fitment data. Pipeline processes ~450K users with
+    personalized recommendations based on vehicle ownership, purchase
+    history, and browsing behavior.
+  key_tables:
+    - auxia-reporting.company_1950_jp.final_vehicle_recommendations
+    - auxia-gcp.company_1950.ingestion_unified_schema_incremental
+    - auxia-gcp.data_company_1950.vehicle_product_fitment_data
+    - auxia-gcp.data_company_1950.import_items
+    - auxia-gcp.data_company_1950.import_orders
+  key_metrics:
+    - CTR (click-through rate)
+    - Conversion rate (clicks to orders)
+    - Revenue per user
+    - Catalog coverage
