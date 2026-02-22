@@ -20,6 +20,8 @@ Auxia manages marketing treatments (push notifications, in-app messages, emails)
 | 4 | **No scheduled monitoring** — anomalies (CTR drops, pipeline failures) go undetected until someone manually checks | Delayed response to production issues |
 | 5 | **Multi-project blindness** — each project is analyzed in isolation with no shared patterns across the portfolio | Missed cross-project insights |
 | 6 | **Security exposure** — ad-hoc LLM access to BigQuery/GCS has no guardrails against destructive operations | Risk of accidental data mutation |
+| 7 | **No external research capability** — marketing teams don't just analyze internal data. They research competitors, market trends, industry benchmarks, creative inspiration from other brands | Agent is blind to the outside world, limits strategic value |
+| 8 | **Large result sets blow up context** — when a BigQuery query returns 10K rows, the raw data is injected directly into the LLM's context window, wasting tokens and degrading reasoning quality | Context pollution from data the LLM shouldn't be "reading" |
 
 ### What We're Building
 
@@ -31,6 +33,8 @@ An autonomous marketing agent that:
 - Runs **on schedule** for continuous monitoring
 - Works across **multiple Auxia projects** with per-project isolation
 - Enforces **strict security guardrails** at every layer
+- Supports **external research** — competitor analysis, market trends, industry benchmarks — not just internal data
+- Uses **context buffering** to keep large datasets out of the LLM's context, passing file references instead of raw data
 
 ---
 
@@ -83,6 +87,42 @@ After multiple sessions over weeks, the agent:
 2. Finds stored findings from 10 previous sessions
 3. Identifies recurring patterns (e.g., "CTR dips every Monday")
 4. Saves the pattern with category `pattern` for future reference
+
+### UC-5: External Market Research (Planned — Phase 3+)
+
+**Trigger**: CLI or Slack.
+
+Prompt: *"Research how competitors are using push notifications for cart abandonment. Find industry benchmarks for push CTR."*
+
+Marketing teams don't just analyze internal treatments — they need to research what's happening outside:
+- **Competitor analysis**: What messaging strategies are competitors using? What channels?
+- **Industry benchmarks**: What's a good CTR for push notifications in e-commerce? How does our performance compare?
+- **Creative inspiration**: What subject lines, copy patterns, and CTAs are working across the industry?
+- **Market trends**: Are there seasonal patterns, regulatory changes, or platform shifts to be aware of?
+
+The agent would:
+1. Search the web for industry benchmarks and competitor strategies
+2. Cross-reference findings with internal performance data from BigQuery
+3. Produce a comparative analysis: internal metrics vs. industry standards
+4. Save benchmarks to memory for future reference
+
+**Status**: Requires external research tools (web search, URL fetch) — planned for Phase 3+.
+
+### UC-6: Large-Scale Data Processing with Context Buffering (Planned — Phase 3+)
+
+**Trigger**: Any.
+
+Prompt: *"Analyze all 50,000 user events from last week and identify drop-off segments."*
+
+For large result sets, the agent:
+1. Queries BigQuery — result is 50K rows
+2. Instead of injecting raw rows into context, writes result to GCS as a file reference
+3. The orchestrator LLM sees only: `gs://auxia-agent/agent/artifacts/events_20260222.csv (50,000 rows, 12 columns)`
+4. Spawns a subagent with the file reference to perform the actual analysis
+5. Subagent reads the data, computes aggregates, returns a concise summary
+6. Orchestrator reasons about the summary — never touches raw data
+
+**Status**: Requires context buffering implementation — planned for Phase 3+.
 
 ---
 
@@ -459,6 +499,82 @@ fan_out_classify(
 
 ---
 
+### 4.7 Context Buffering — Solves: Data Overload Crashing the Thinker (Planned)
+
+**Problem**: When `query_bigquery` returns 10K rows, the raw data is injected directly into the orchestrator's context. The LLM wastes tokens "reading" rows it can't meaningfully process, and the context fills up faster — triggering premature compaction and losing earlier reasoning.
+
+The orchestrator should **decide what to do**, not **read raw data**. It should be a thinker, not a data processor.
+
+**Current behavior** (problem):
+```
+query_bigquery("SELECT * FROM events LIMIT 10000")
+    │
+    └── Result: 10,000 rows as markdown table → injected into LLM context
+        → Context jumps from 20K to 80K tokens
+        → LLM tries to "read" the table, hallucinates patterns
+        → Compaction triggers early, losing prior reasoning
+```
+
+**Planned behavior** (context buffering):
+```
+query_bigquery("SELECT * FROM events LIMIT 10000")
+    │
+    ├── If result > threshold (e.g., 500 rows):
+    │     1. Write full result to GCS: gs://bucket/agent/artifacts/query_abc123.csv
+    │     2. Return to LLM: "Query returned 10,000 rows. Saved to gs://...csv.
+    │        Preview (first 10 rows): [small markdown table]
+    │        Columns: user_id, event, timestamp, value
+    │        Summary: 10K rows, 4 columns, date range 2026-01-01 to 2026-01-31"
+    │
+    └── If result <= threshold:
+          Return inline as today (small results are fine in context)
+```
+
+**Why this matters**: The orchestrator's context stays at ~2 paragraphs regardless of data volume. It can then decide: "I need to aggregate by week — let me write a new SQL query" or "I'll delegate the file analysis to a subagent." The raw data never pollutes the thinker's reasoning.
+
+**Implementation**: Phase 3. Requires changes to `query_bigquery` tool handler + GCS write integration.
+
+---
+
+### 4.8 External Research Tools — Solves: Agent Blind to the Outside World (Planned)
+
+**Problem**: Marketing teams don't just analyze internal treatment data. A significant part of their work involves external research:
+- What are competitors doing?
+- What are industry benchmarks for our channel?
+- What messaging trends are working across the market?
+- Are there regulatory or platform changes we need to know about?
+
+The current agent has **zero external access**. It can only reason about data already in BigQuery and treatments already in Auxia Console.
+
+**Planned tools**:
+
+| Tool | What It Does |
+|------|-------------|
+| `web_search` | Search the web for industry benchmarks, competitor strategies, market reports |
+| `fetch_url` | Fetch and extract content from a specific URL (blog post, report, documentation) |
+| `search_news` | Search recent news for industry trends, regulatory changes, platform updates |
+
+**How it integrates**:
+```
+Agent prompt: "How does our push notification CTR compare to industry benchmarks?"
+    │
+    ├── 1. search_memory("push notification industry benchmark") → check if we already know
+    ├── 2. web_search("push notification CTR benchmark 2026 e-commerce") → find external data
+    ├── 3. query_bigquery("SELECT avg(ctr) FROM push_metrics WHERE ...") → our internal data
+    ├── 4. spawn_subagent("Compare our 2.3% CTR against industry benchmark of 3.1%") → analysis
+    └── 5. save_memory("Industry push CTR benchmark: 3.1%. We are at 2.3%.", category="finding")
+```
+
+**Security considerations**:
+- URL fetch limited to HTTPS only
+- Response size capped (prevent downloading massive files into context)
+- Content extracted as text/markdown, not raw HTML
+- Results go through the same context buffering as BigQuery (large pages → GCS file reference)
+
+**Implementation**: Phase 3+. Requires new tool module `src/agent/tools/research.py`.
+
+---
+
 ## 5. End-to-End Data Flow
 
 ### Example: Agent Startup → Analysis → Report
@@ -760,13 +876,15 @@ All external dependencies (Anthropic API, BigQuery, GCS, Auxia Console) are mock
 |-------|--------|------|-----------------|
 | **1** | Done | Core agent loop, tools, plan management, CLI, Metaflow | Autonomous analysis via CLI, GKE execution |
 | **2** | Done | BM25 memory, multi-project, Auxia Console tools, session routing | Cross-session learning, project-aware agent |
-| **3** | Planned | Slack trigger, cron scheduling, cost tracking per run | Continuous monitoring, team accessibility |
+| **3** | Planned | Slack trigger, cron scheduling, context buffering, external research tools, cost tracking | Continuous monitoring, external intelligence, team accessibility |
 | **4** | Planned | Evaluation framework, human-in-the-loop review, treatment write actions | Quality assurance, safe write operations |
 
 ### Phase 3 Scope (Next)
 
 - **Slack trigger**: Respond to messages in a Slack channel. Route through session router with `slack:{channel}:{project}:{session}` keys.
 - **Cron scheduling**: Metaflow `@schedule` with configurable cadence. Daily health checks, weekly performance summaries.
+- **Context buffering**: Large query results written to GCS as file references instead of injected into LLM context. Keeps the orchestrator's context small and reasoning clean. Threshold-based: small results stay inline, large results get buffered.
+- **External research tools**: Web search, URL fetch, news search. Gives the agent access to industry benchmarks, competitor strategies, and market trends — not just internal data. Gated by HTTPS-only, size caps, and content extraction.
 - **Cost tracking**: Per-session token usage and BigQuery bytes billed. Stored in session checkpoint, aggregatable for reporting.
 
 ### Phase 4 Scope (Future)

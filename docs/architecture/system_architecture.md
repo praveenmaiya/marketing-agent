@@ -137,7 +137,7 @@ Each tool is a `ToolDef` with:
 | `list_treatments`, `get_treatment` | tools/auxia.py | Browse Auxia treatments |
 | `list_surfaces`, `list_treatment_types` | tools/auxia.py | Project structure discovery |
 | `list_objectives`, `list_data_fields` | tools/auxia.py | Business goals and targeting attributes |
-| `query_bigquery`, `get_table_schema`, `check_table_exists` | tools/bigquery.py | Data analysis |
+| `query_bigquery`, `get_table_schema`, `check_table_exists` | tools/bigquery.py | Data analysis (large results buffered to GCS) |
 | `read_gcs`, `write_gcs`, `list_gcs` | tools/gcs.py | Artifact storage |
 | `search_memory`, `save_memory`, `get_session_history` | tools/memory.py | Cross-session memory |
 | `spawn_subagent`, `fan_out_classify` | tools/subagent.py | Parallel child LLM calls |
@@ -149,6 +149,7 @@ Each tool is a `ToolDef` with:
 - Auxia Console: Read-only access (Phase 1). No write operations exposed.
 - Table ID validation: regex ensures only safe characters in BigQuery identifiers.
 - URL encoding: `urllib.parse.urlencode()` for BFF API query parameters.
+- Context buffering: Query results >50 rows written to GCS as CSV, LLM sees preview + file reference only. Prevents context overload.
 
 ### 5. Auxia Console Integration (`src/agent/tools/auxia.py`)
 
