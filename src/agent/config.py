@@ -51,6 +51,7 @@ class AgentBehaviorConfig:
     enable_subagents: bool = True
     enable_fan_out: bool = True
     fan_out_max_parallel: int = 20
+    context_buffer_threshold: int = 50  # Rows above this get buffered to GCS
 
 
 @dataclass

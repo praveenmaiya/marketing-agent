@@ -36,6 +36,7 @@ agent:
   enable_subagents: true
   enable_fan_out: true
   fan_out_max_parallel: 20   # Max concurrent Haiku classifiers
+  context_buffer_threshold: 50  # Rows above this get buffered to GCS
 
 # Auxia Console API
 auxia:
