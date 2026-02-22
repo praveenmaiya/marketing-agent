@@ -18,7 +18,7 @@ def config():
 
 @pytest.fixture
 def context(config):
-    return ContextEngine(config, session_id="orch-test")
+    return ContextEngine(config, session_id="orch-test", project_id="test-proj")
 
 
 # ── Plan Manager ──────────────────────────────────────────────
@@ -166,12 +166,27 @@ class TestOrchestrator:
         orch.add_tools([custom_tool])
         assert orch.registry.get("custom") is not None
 
-    def test_build_system_prompt(self, config, context):
+    def test_build_system_prompt_generic(self, config, context):
         orch = Orchestrator(config, context=context)
         prompt = orch._build_system_prompt()
-        assert "Holley" in prompt
-        assert "vehicle fitment" in prompt
+        # Should reference Auxia, not Holley
+        assert "Auxia" in prompt
+        assert "test-proj" in prompt
         assert "No active plan" in prompt
+        # Should contain rules
+        assert "Rules" in prompt
+        assert "ALWAYS make a plan" in prompt
+        assert "Do NOT loop on errors" in prompt
+
+    def test_build_system_prompt_with_project_context(self, config, context):
+        orch = Orchestrator(
+            config,
+            context=context,
+            project_context="Surfaces: home_page, checkout\nTreatment types: Push, Email",
+        )
+        prompt = orch._build_system_prompt()
+        assert "home_page" in prompt
+        assert "Push" in prompt
 
     def test_build_system_prompt_with_plan(self, config, context):
         orch = Orchestrator(config, context=context)
@@ -179,6 +194,12 @@ class TestOrchestrator:
         prompt = orch._build_system_prompt()
         assert "Analyze data" in prompt
         assert "Step A" in prompt
+
+    def test_set_project_context(self, config, context):
+        orch = Orchestrator(config, context=context)
+        orch.set_project_context("Surfaces: home, checkout")
+        prompt = orch._build_system_prompt()
+        assert "home, checkout" in prompt
 
     def test_extract_text_from_string(self, config, context):
         orch = Orchestrator(config, context=context)

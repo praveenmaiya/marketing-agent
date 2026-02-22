@@ -1,5 +1,5 @@
 # Marketing Agent Configuration
-# See docs in the architecture plan for component breakdown
+# Project-agnostic — project context is loaded dynamically from Auxia Console API
 
 # LLM models
 models:
@@ -14,16 +14,16 @@ tokens:
   compaction_threshold: 120000  # Trigger compaction at this level
   summary_target: 4000       # Target size for compacted summary
 
-# BigQuery (reuses project settings)
+# BigQuery
 bigquery:
   project: ${BQ_PROJECT:-auxia-reporting}
-  dataset: ${BQ_DATASET:-temp_holley_v5_17}
+  dataset: ${BQ_DATASET:-agent_dataset}
   location: US
   max_bytes_billed: 10737418240  # 10 GB safety limit
 
 # GCS persistence
 gcs:
-  bucket: ${GCS_BUCKET:-holley-models-dev}
+  bucket: ${GCS_BUCKET:-auxia-agent}
   session_prefix: agent/sessions/
   artifact_prefix: agent/artifacts/
   memory_prefix: agent/memory/
@@ -37,23 +37,10 @@ agent:
   enable_fan_out: true
   fan_out_max_parallel: 20   # Max concurrent Haiku classifiers
 
-# Domain context injected into system prompt
-domain:
-  company: Holley
-  domain: vehicle fitment recommendations
-  description: >
-    Automotive parts recommendation system using collaborative filtering
-    and vehicle fitment data. Pipeline processes ~450K users with
-    personalized recommendations based on vehicle ownership, purchase
-    history, and browsing behavior.
-  key_tables:
-    - auxia-reporting.company_1950_jp.final_vehicle_recommendations
-    - auxia-gcp.company_1950.ingestion_unified_schema_incremental
-    - auxia-gcp.data_company_1950.vehicle_product_fitment_data
-    - auxia-gcp.data_company_1950.import_items
-    - auxia-gcp.data_company_1950.import_orders
-  key_metrics:
-    - CTR (click-through rate)
-    - Conversion rate (clicks to orders)
-    - Revenue per user
-    - Catalog coverage
+# Auxia Console API
+auxia:
+  enabled: true
+  bff_base_url: ${AUXIA_BFF_URL:-https://console.auxia.io}
+
+# Project ID — set via CLI --project flag or env var
+project_id: ${AUXIA_PROJECT_ID:-}

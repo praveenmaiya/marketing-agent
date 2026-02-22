@@ -1,7 +1,14 @@
 """Memory tools for the marketing agent.
 
-Provides semantic search and storage for cross-session learnings.
-Backed by the context engine's warm/cold storage layers.
+Provides BM25 search and categorized storage for cross-session learnings.
+Backed by the context engine's warm (GCS JSONL) + cold (BigQuery) layers.
+
+Memory categories:
+    finding         — data-driven observations (e.g., "Email CTR dropped 15%")
+    decision        — choices made (e.g., "Switched from weekly to daily push")
+    pattern         — recurring trends (e.g., "CTR always dips on Mondays")
+    session_summary — auto-generated session recap
+    general         — anything else
 """
 
 from __future__ import annotations
@@ -17,12 +24,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+MEMORY_CATEGORIES = ["finding", "decision", "pattern", "session_summary", "general"]
+
 
 def create_memory_tools(context_engine: ContextEngine) -> list[ToolDef]:
     """Create memory tools that use the context engine for storage."""
 
     def search_memory(params: dict) -> str:
-        """Search past memories and session history."""
+        """Search past memories using BM25 via BigQuery."""
         query = params["query"]
         limit = params.get("limit", 10)
         results = context_engine.search_memories(query, limit=limit)
@@ -34,8 +43,16 @@ def create_memory_tools(context_engine: ContextEngine) -> list[ToolDef]:
         """Save a durable fact or learning to memory."""
         content = params["content"]
         category = params.get("category", "general")
-        context_engine.save_memory(content, category=category)
-        return f"Memory saved under category '{category}'."
+        if category not in MEMORY_CATEGORIES:
+            return (
+                f"Invalid category '{category}'. "
+                f"Use one of: {MEMORY_CATEGORIES}"
+            )
+        memory = context_engine.save_memory(content, category=category)
+        return (
+            f"Memory saved (id={memory['id']}, category='{category}'). "
+            f"This will persist across sessions and be searchable via BM25."
+        )
 
     def get_session_history(params: dict) -> str:
         """Get summary of past agent sessions."""
@@ -49,15 +66,16 @@ def create_memory_tools(context_engine: ContextEngine) -> list[ToolDef]:
         ToolDef(
             name="search_memory",
             description=(
-                "Search past analyses, learnings, and session history. "
-                "Use this to recall what was done before and avoid duplicate work."
+                "Search past analyses, learnings, and session history using BM25 full-text search. "
+                "Use this BEFORE starting work to check if similar analysis was done before. "
+                "Returns memories sorted by recency."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Semantic search query",
+                        "description": "Search query (matched via BigQuery SEARCH / BM25)",
                     },
                     "limit": {
                         "type": "integer",
@@ -72,19 +90,22 @@ def create_memory_tools(context_engine: ContextEngine) -> list[ToolDef]:
         ToolDef(
             name="save_memory",
             description=(
-                "Save an important finding, decision, or learning for future sessions. "
-                "Use this for durable facts that should survive session compaction."
+                "Save an important finding, decision, or pattern for future sessions. "
+                "Memories persist to GCS and BigQuery and survive session compaction. "
+                "Use categories: 'finding' for data observations, 'decision' for choices made, "
+                "'pattern' for recurring trends, 'general' for everything else."
             ),
             input_schema={
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "The fact or learning to remember",
+                        "description": "The fact, finding, or learning to remember",
                     },
                     "category": {
                         "type": "string",
-                        "description": "Category: 'analysis', 'decision', 'finding', 'general'",
+                        "enum": MEMORY_CATEGORIES,
+                        "description": "Memory category",
                         "default": "general",
                     },
                 },

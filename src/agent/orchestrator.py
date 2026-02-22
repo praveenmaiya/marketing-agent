@@ -1,23 +1,25 @@
 """Orchestrator: the main ReAct loop with plan-as-artifact management.
 
 Implements the core agent loop:
-1. Assemble system prompt with domain context + plan state
+1. Assemble system prompt with project context + plan state + rules
 2. Send messages to Claude API with available tools
 3. Execute tool calls, inject results
 4. Check if plan needs updating
 5. Checkpoint state periodically to GCS
-6. Compact context when approaching token limits
+6. Pre-compaction memory flush before context truncation
 
 Design choices:
 - Plan is stored as a tool-call output, so the model can reference and revise it
 - Each plan step tracks status (pending/in_progress/completed/failed) and result
 - Subagent isolation: child LLMs get scoped context, not the full conversation
+- Pre-compaction flush: model saves important findings before context truncation
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from datetime import UTC, datetime
 from typing import Any
@@ -231,11 +233,13 @@ class Orchestrator:
         config: AgentConfig,
         context: ContextEngine | None = None,
         tools: list[ToolDef] | None = None,
+        project_context: str | None = None,
     ) -> None:
         self.config = config
         self.client = anthropic.Anthropic()
         self.context = context or ContextEngine(config)
         self.plan_manager = PlanManager(self.context, max_steps=config.agent.max_plan_steps)
+        self._project_context = project_context or ""
 
         # Build tool registry
         self.registry = ToolRegistry()
@@ -253,6 +257,10 @@ class Orchestrator:
         """Add tools to the registry after construction."""
         for tool in tools:
             self.registry.register(tool)
+
+    def set_project_context(self, context_text: str) -> None:
+        """Set dynamic project context for system prompt."""
+        self._project_context = context_text
 
     def run(self, prompt: str) -> str:
         """Execute the main ReAct loop.
@@ -335,34 +343,59 @@ class Orchestrator:
         raise RuntimeError("Max API retries exceeded")
 
     def _build_system_prompt(self) -> str:
-        """Assemble the system prompt with domain context and plan state."""
-        domain = self.config.domain
+        """Assemble the system prompt with project context, plan state, and rules."""
         plan_text = self.plan_manager.format_for_prompt()
+        project_id = self.context.project_id
 
-        return f"""You are a marketing analyst agent for {domain.company}.
-Domain: {domain.domain}
+        # Base identity
+        prompt_parts = [
+            f"You are a marketing automation agent for Auxia project '{project_id}'.",
+            "",
+        ]
 
-{domain.description}
+        # Dynamic project context (from Auxia Console API discovery)
+        if self._project_context:
+            prompt_parts.extend([
+                "## Project Context",
+                self._project_context,
+                "",
+            ])
 
-## Available Data
-Key BigQuery tables:
-{chr(10).join(f'- {t}' for t in domain.key_tables)}
+        # Current plan
+        prompt_parts.extend([
+            "## Current Plan",
+            plan_text,
+            "",
+        ])
 
-Key metrics:
-{chr(10).join(f'- {m}' for m in domain.key_metrics)}
+        # Agent rules (anti-looping, guardrails, memory-first)
+        prompt_parts.extend([
+            "## Rules",
+            "1. ALWAYS make a plan before executing. Update the plan as you learn.",
+            "2. Before querying BigQuery, validate with dry_run=true first.",
+            "3. ALWAYS search memory before starting analysis — check if similar work was done before.",
+            "4. If you find something important, save it to memory immediately using save_memory.",
+            "5. Do NOT repeat the same query twice. Check memory and plan results first.",
+            "6. Do NOT loop on errors. After 2 failed attempts at the same action, report the issue and move on.",
+            "7. When context is getting long, summarize intermediate results before continuing.",
+            "8. Use spawn_subagent for any analysis requiring more than 3 tool calls.",
+            "9. Save a session summary to memory before finishing (category='session_summary').",
+            "10. Be concise and data-driven. Show numbers, not narratives.",
+            "",
+        ])
 
-## Current Plan
-{plan_text}
+        # Tool usage instructions
+        prompt_parts.extend([
+            "## Instructions",
+            "1. For complex tasks, use make_plan to create a structured plan first.",
+            "2. Execute steps one at a time, updating status as you go.",
+            "3. Use query_bigquery for data analysis. Always validate with dry_run first.",
+            "4. Use spawn_subagent for focused sub-analyses that don't need the full context.",
+            "5. Use save_memory for important findings that should persist across sessions.",
+            "6. If your plan needs adjustment based on results, use revise_plan.",
+        ])
 
-## Instructions
-1. For complex tasks, use make_plan to create a structured plan first.
-2. Execute steps one at a time, updating status as you go.
-3. Use query_bigquery for data analysis. Always validate with dry_run first.
-4. Use spawn_subagent for focused sub-analyses that don't need the full context.
-5. Use save_memory for important findings that should persist across sessions.
-6. If your plan needs adjustment based on results, use revise_plan.
-7. Be concise and data-driven in your final response.
-"""
+        return "\n".join(prompt_parts)
 
     def _execute_tool_calls(self, content: list[Any]) -> list[dict[str, Any]]:
         """Execute all tool calls in the response and return results."""
@@ -410,7 +443,11 @@ Key metrics:
             self.context.save_session_to_gcs()
 
     def _maybe_compact(self) -> None:
-        """Compact context if it's getting too large."""
+        """Compact context if it's getting too large.
+
+        Implements pre-compaction memory flush: before truncating,
+        use the LLM to extract and save important findings.
+        """
         messages = self.context.get_messages()
         # Rough estimate: ~4 chars per token
         estimated_tokens = sum(
@@ -423,12 +460,42 @@ Key metrics:
                 f"threshold {self.config.tokens.compaction_threshold} — compacting"
             )
 
+            # Pre-compaction flush: extract important findings before truncation
+            def flush_fn(msgs: list[dict]) -> list[dict]:
+                """Use the LLM to identify memories worth saving."""
+                text = json.dumps(msgs, default=str)[:8000]
+                try:
+                    response = self.client.messages.create(
+                        model=self.config.models.classifier,
+                        max_tokens=2000,
+                        system=(
+                            "Extract important findings, decisions, and patterns from this "
+                            "conversation that should be remembered for future sessions. "
+                            "Return a JSON array of objects with 'content' and 'category' fields. "
+                            "Categories: finding, decision, pattern. "
+                            "Only include genuinely important, durable information. "
+                            "Return [] if nothing is worth saving."
+                        ),
+                        messages=[{"role": "user", "content": text}],
+                    )
+                    raw = response.content[0].text
+                    json_match = re.search(r'\[.*\]', raw, re.DOTALL)
+                    if json_match:
+                        return json.loads(json_match.group())
+                    return []
+                except Exception as e:
+                    logger.warning(f"Pre-compaction flush failed: {e}")
+                    return []
+
+            self.context.flush_before_compaction(flush_fn=flush_fn)
+
+            # Now compact with LLM summarization
             def summarize(msgs: list[dict]) -> str:
                 """Use the LLM to summarize old messages."""
                 text = json.dumps(msgs, default=str)[:8000]
                 try:
                     response = self.client.messages.create(
-                        model=self.config.models.classifier,  # Use Haiku for speed
+                        model=self.config.models.classifier,
                         max_tokens=self.config.tokens.summary_target,
                         system="Summarize this conversation concisely. Keep key facts, decisions, and data points.",
                         messages=[{"role": "user", "content": text}],

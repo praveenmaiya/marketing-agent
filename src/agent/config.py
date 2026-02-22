@@ -30,14 +30,14 @@ class TokenConfig:
 @dataclass
 class BigQueryConfig:
     project: str = "auxia-reporting"
-    dataset: str = "temp_holley_v5_17"
+    dataset: str = "agent_dataset"
     location: str = "US"
     max_bytes_billed: int = 10_737_418_240  # 10 GB
 
 
 @dataclass
 class GCSConfig:
-    bucket: str = "holley-models-dev"
+    bucket: str = "auxia-agent"
     session_prefix: str = "agent/sessions/"
     artifact_prefix: str = "agent/artifacts/"
     memory_prefix: str = "agent/memory/"
@@ -54,12 +54,11 @@ class AgentBehaviorConfig:
 
 
 @dataclass
-class DomainConfig:
-    company: str = "Holley"
-    domain: str = "vehicle fitment recommendations"
-    description: str = ""
-    key_tables: list[str] = field(default_factory=list)
-    key_metrics: list[str] = field(default_factory=list)
+class AuxiaConfig:
+    """Configuration for Auxia Console API integration."""
+    enabled: bool = True
+    # BFF base URL — can be overridden for staging/dev
+    bff_base_url: str = "https://console.auxia.io"
 
 
 @dataclass
@@ -69,7 +68,8 @@ class AgentConfig:
     bigquery: BigQueryConfig = field(default_factory=BigQueryConfig)
     gcs: GCSConfig = field(default_factory=GCSConfig)
     agent: AgentBehaviorConfig = field(default_factory=AgentBehaviorConfig)
-    domain: DomainConfig = field(default_factory=DomainConfig)
+    auxia: AuxiaConfig = field(default_factory=AuxiaConfig)
+    project_id: str = ""  # Auxia project ID, set at runtime
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> AgentConfig:
@@ -86,7 +86,8 @@ class AgentConfig:
             bigquery=BigQueryConfig(**d.get("bigquery", {})),
             gcs=GCSConfig(**d.get("gcs", {})),
             agent=AgentBehaviorConfig(**d.get("agent", {})),
-            domain=DomainConfig(**d.get("domain", {})),
+            auxia=AuxiaConfig(**d.get("auxia", {})),
+            project_id=d.get("project_id", ""),
         )
 
     @classmethod

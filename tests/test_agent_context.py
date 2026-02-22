@@ -14,7 +14,7 @@ def config():
 
 @pytest.fixture
 def context(config):
-    return ContextEngine(config, session_id="test-123")
+    return ContextEngine(config, session_id="test-123", project_id="proj-abc")
 
 
 class TestHotLayer:
@@ -49,6 +49,13 @@ class TestHotLayer:
 
     def test_session_id(self, context):
         assert context.session_id == "test-123"
+
+    def test_project_id(self, context):
+        assert context.project_id == "proj-abc"
+
+    def test_default_project_id(self, config):
+        ctx = ContextEngine(config)
+        assert ctx.project_id == "default"
 
     def test_auto_session_id(self, config):
         ctx = ContextEngine(config)
@@ -105,9 +112,40 @@ class TestCompaction:
         assert "Previous conversation summary" in result
 
 
+class TestPreCompactionFlush:
+    def test_flush_with_custom_function(self, context):
+        context.add_message("user", "analyze campaigns")
+        context.add_message("assistant", "CTR dropped 15% in Q4")
+
+        def flush_fn(msgs):
+            return [{"content": "CTR dropped 15% in Q4", "category": "finding"}]
+
+        saved = context.flush_before_compaction(flush_fn=flush_fn)
+        assert len(saved) == 1
+        assert saved[0]["category"] == "finding"
+        assert "CTR dropped" in saved[0]["content"]
+
+    def test_flush_heuristic_fallback(self, context):
+        context.add_message("assistant", "Found something important about Q4")
+        context.add_message("assistant", "Revenue is up 20%")
+
+        saved = context.flush_before_compaction()
+        assert len(saved) == 1
+        assert saved[0]["category"] == "session_summary"
+
+    def test_flush_empty_when_no_messages(self, context):
+        saved = context.flush_before_compaction()
+        assert len(saved) == 0
+
+    def test_flush_empty_when_no_assistant_messages(self, context):
+        context.add_message("user", "hello")
+        saved = context.flush_before_compaction()
+        assert len(saved) == 0
+
+
 class TestSerialization:
     def test_to_dict_and_from_dict(self, config):
-        ctx = ContextEngine(config, session_id="ser-test")
+        ctx = ContextEngine(config, session_id="ser-test", project_id="proj-xyz")
         ctx.add_message("user", "hello")
         ctx.set_plan({"objective": "test", "steps": []})
         ctx.set_scratchpad("key", "val")
@@ -115,6 +153,7 @@ class TestSerialization:
 
         data = ctx.to_dict()
         assert data["session_id"] == "ser-test"
+        assert data["project_id"] == "proj-xyz"
         assert len(data["messages"]) == 1
         assert data["plan"]["objective"] == "test"
         assert data["scratchpad"]["key"] == "val"
@@ -123,6 +162,7 @@ class TestSerialization:
         # Restore
         restored = ContextEngine.from_dict(data, config)
         assert restored.session_id == "ser-test"
+        assert restored.project_id == "proj-xyz"
         assert len(restored.get_messages()) == 1
         assert restored.get_plan()["objective"] == "test"
         assert restored.get_scratchpad("key") == "val"
@@ -137,11 +177,69 @@ class TestSerialization:
         restored = ContextEngine.from_dict(data, config)
         assert restored.turn_count == 3
 
+    def test_roundtrip_preserves_project_id(self, config):
+        ctx = ContextEngine(config, session_id="pid-test", project_id="my-proj")
+        data = ctx.to_dict()
+        restored = ContextEngine.from_dict(data, config)
+        assert restored.project_id == "my-proj"
+
+    def test_default_project_id_on_restore(self, config):
+        """Old serialized data without project_id should default to 'default'."""
+        data = {
+            "session_id": "old-session",
+            "created_at": "2024-01-01T00:00:00",
+            "messages": [],
+        }
+        restored = ContextEngine.from_dict(data, config)
+        assert restored.project_id == "default"
+
+    def test_migration_timestamp_to_created_at(self, config):
+        """Phase 1 memories with 'timestamp' should be migrated to 'created_at'."""
+        data = {
+            "session_id": "old-session",
+            "created_at": "2024-01-01T00:00:00",
+            "messages": [],
+            "memories": [
+                {
+                    "id": "abc",
+                    "content": "old finding",
+                    "category": "finding",
+                    "session_id": "old-session",
+                    "timestamp": "2024-01-15T10:00:00",
+                },
+            ],
+        }
+        restored = ContextEngine.from_dict(data, config)
+        mem = restored._memories[0]
+        assert "created_at" in mem
+        assert mem["created_at"] == "2024-01-15T10:00:00"
+        assert "timestamp" not in mem
+
+    def test_migration_preserves_existing_created_at(self, config):
+        """Phase 2 memories with 'created_at' should not be changed."""
+        data = {
+            "session_id": "new-session",
+            "created_at": "2025-01-01T00:00:00",
+            "messages": [],
+            "memories": [
+                {
+                    "id": "def",
+                    "content": "new finding",
+                    "category": "finding",
+                    "session_id": "new-session",
+                    "created_at": "2025-01-15T10:00:00",
+                },
+            ],
+        }
+        restored = ContextEngine.from_dict(data, config)
+        mem = restored._memories[0]
+        assert mem["created_at"] == "2025-01-15T10:00:00"
+
 
 class TestMemory:
     def test_save_and_search_memory_in_hot_layer(self, context):
         context.save_memory("CTR for personalized is 2.5%", category="finding")
-        context.save_memory("Revenue increased 15% in Q4", category="analysis")
+        context.save_memory("Revenue increased 15% in Q4", category="finding")
 
         results = context.search_memories("CTR")
         assert len(results) >= 1
@@ -158,5 +256,22 @@ class TestMemory:
         assert len(results) == 1
         assert results[0]["category"] == "decision"
         assert results[0]["session_id"] == "test-123"
-        assert "timestamp" in results[0]
+        assert results[0]["project_id"] == "proj-abc"
+        assert "created_at" in results[0]
         assert "id" in results[0]
+
+    def test_memory_categories(self, context):
+        context.save_memory("a finding", category="finding")
+        context.save_memory("a decision", category="decision")
+        context.save_memory("a pattern", category="pattern")
+
+        # All should be searchable
+        findings = context.search_memories("finding")
+        assert len(findings) >= 1
+
+    def test_save_memory_returns_dict(self, context):
+        mem = context.save_memory("test content", category="finding")
+        assert isinstance(mem, dict)
+        assert mem["content"] == "test content"
+        assert mem["category"] == "finding"
+        assert "id" in mem

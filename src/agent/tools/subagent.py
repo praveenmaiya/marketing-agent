@@ -53,8 +53,7 @@ def create_subagent_tools(config: AgentConfig) -> list[ToolDef]:
             return f"ERROR: Model '{model}' not allowed. Use one of: {sorted(allowed_models)}"
 
         system = (
-            f"You are a focused analyst for {config.domain.company}. "
-            f"Domain: {config.domain.domain}.\n\n"
+            "You are a focused marketing analyst for Auxia. "
             "Your single objective is stated below. "
             "Provide a concise, structured answer. No preamble.\n\n"
             f"Context:\n{context}"

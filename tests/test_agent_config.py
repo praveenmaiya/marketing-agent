@@ -5,6 +5,7 @@ import pytest
 
 from src.agent.config import (
     AgentConfig,
+    AuxiaConfig,
     BigQueryConfig,
     GCSConfig,
     ModelConfig,
@@ -20,20 +21,25 @@ class TestAgentConfig:
         assert config.tokens.max_context == 180_000
         assert config.bigquery.project == "auxia-reporting"
         assert config.agent.max_turns == 50
+        assert config.project_id == ""
+        assert config.auxia.enabled is True
 
     def test_from_dict(self):
         raw = {
             "models": {"orchestrator": "claude-opus-4-6"},
             "tokens": {"max_context": 100_000},
             "bigquery": {"project": "test-project"},
+            "project_id": "proj-123",
         }
         config = AgentConfig._from_dict(raw)
         assert config.models.orchestrator == "claude-opus-4-6"
         assert config.tokens.max_context == 100_000
         assert config.bigquery.project == "test-project"
+        assert config.project_id == "proj-123"
         # Defaults preserved for unspecified sections
-        assert config.gcs.bucket == "holley-models-dev"
+        assert config.gcs.bucket == "auxia-agent"
         assert config.agent.max_turns == 50
+        assert config.auxia.enabled is True
 
     def test_from_yaml(self, tmp_path):
         yaml_content = """
@@ -47,11 +53,10 @@ bigquery:
 agent:
   max_turns: 100
   enable_fan_out: false
-domain:
-  company: TestCo
-  key_tables:
-    - table_a
-    - table_b
+auxia:
+  enabled: true
+  bff_base_url: https://staging.auxia.io
+project_id: yaml-proj
 """
         config_file = tmp_path / "test_agent.yaml"
         config_file.write_text(yaml_content)
@@ -63,8 +68,8 @@ domain:
         assert config.bigquery.dataset == "my_dataset"
         assert config.agent.max_turns == 100
         assert config.agent.enable_fan_out is False
-        assert config.domain.company == "TestCo"
-        assert len(config.domain.key_tables) == 2
+        assert config.project_id == "yaml-proj"
+        assert config.auxia.bff_base_url == "https://staging.auxia.io"
 
     def test_partial_yaml(self, tmp_path):
         yaml_content = """
@@ -79,10 +84,16 @@ models:
         # All other defaults should be intact
         assert config.tokens.max_output == 8192
         assert config.gcs.session_prefix == "agent/sessions/"
+        assert config.project_id == ""
 
     def test_missing_yaml_raises(self):
         with pytest.raises(FileNotFoundError):
             AgentConfig.from_yaml("/nonexistent/path.yaml")
+
+    def test_no_domain_config(self):
+        """DomainConfig was removed — verify it's gone."""
+        config = AgentConfig.default()
+        assert not hasattr(config, "domain")
 
 
 class TestModelConfig:
@@ -104,6 +115,10 @@ class TestBigQueryConfig:
         config = BigQueryConfig()
         assert config.max_bytes_billed == 10 * 1024 * 1024 * 1024
 
+    def test_default_dataset(self):
+        config = BigQueryConfig()
+        assert config.dataset == "agent_dataset"
+
 
 class TestGCSConfig:
     def test_prefixes_end_with_slash(self):
@@ -111,3 +126,14 @@ class TestGCSConfig:
         assert config.session_prefix.endswith("/")
         assert config.artifact_prefix.endswith("/")
         assert config.memory_prefix.endswith("/")
+
+    def test_default_bucket(self):
+        config = GCSConfig()
+        assert config.bucket == "auxia-agent"
+
+
+class TestAuxiaConfig:
+    def test_defaults(self):
+        config = AuxiaConfig()
+        assert config.enabled is True
+        assert config.bff_base_url == "https://console.auxia.io"

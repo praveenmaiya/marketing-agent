@@ -1,18 +1,18 @@
 # Marketing Agent
 
-Long-running marketing agent for campaign analysis on GCP. ReAct loop with tool calling, plan-as-artifact management, hybrid memory, and subagent fan-out.
+Long-running marketing automation agent for Auxia on GCP. ReAct loop with tool calling, plan-as-artifact management, BM25 memory search, multi-project support, and subagent fan-out.
 
 ## Quick Start
 
 ```bash
-# Run the agent (CLI)
-python -m src.agent.run "Analyze Q4 campaign performance"
+# Run the agent (CLI) with project
+python -m src.agent.run --project <project_id> "Analyze treatment performance"
 
 # Dry run (show config + tools, no execution)
-python -m src.agent.run --dry-run "test"
+python -m src.agent.run --project <id> --dry-run "test"
 
 # Resume a previous session
-python -m src.agent.run --resume <session-id> "Continue"
+python -m src.agent.run --project <id> --resume <session-id> "Continue"
 
 # Run on Kubernetes via Metaflow
 python flows/agent_flow.py run --prompt "Daily health check"
@@ -29,16 +29,24 @@ python -m ruff check src/ tests/
 See [docs/architecture/system_architecture.md](docs/architecture/system_architecture.md) for the full design.
 
 ```
-Trigger (CLI / Cron / Slack / Webhook)
+Trigger (CLI / Cron / Slack)
+  │
+  ▼
+Session Router (trigger-based isolation: cli/slack/cron)
   │
   ▼
 Orchestrator (ReAct loop on GKE)
   ├── Plan Manager (plan-as-artifact, revisable mid-flight)
   ├── Context Engine (hot/warm/cold hybrid memory)
+  │     ├── Hot: in-memory cache
+  │     ├── Warm: GCS JSONL append log (per project)
+  │     ├── Cold: BigQuery BM25 search
+  │     └── Pre-compaction flush (save findings before truncation)
   ├── Tool Router
+  │     ├── Auxia Console (list treatments, surfaces, objectives — read-only)
   │     ├── BigQuery (SELECT only, SQL injection guard)
   │     ├── GCS (path-validated, agent prefixes only)
-  │     ├── Memory (keyword search, Phase 2: vector similarity)
+  │     ├── Memory (BM25 search via BigQuery SEARCH)
   │     └── Subagent Spawner (scoped context, fan-out classification)
   └── Checkpoint (GCS persistence, pod restart recovery)
 ```
@@ -53,25 +61,27 @@ Orchestrator (ReAct loop on GKE)
 ### Core
 | Path | Purpose |
 |------|---------|
-| `src/agent/orchestrator.py` | **ReAct loop, plan manager, system prompt assembly** |
-| `src/agent/context.py` | **Hybrid memory engine (hot/warm/cold)** |
-| `src/agent/config.py` | Config dataclasses + YAML loader |
-| `src/agent/run.py` | CLI entrypoint |
+| `src/agent/orchestrator.py` | **ReAct loop, plan manager, system prompt + rules, pre-compaction flush** |
+| `src/agent/context.py` | **Hybrid memory engine (hot/warm/cold), BM25 search, JSONL persistence** |
+| `src/agent/config.py` | Config dataclasses + YAML loader (project-agnostic) |
+| `src/agent/session.py` | **Session key routing + trigger-based isolation** |
+| `src/agent/run.py` | CLI entrypoint with --project flag |
 
 ### Tools
 | Path | Purpose |
 |------|---------|
 | `src/agent/tools/__init__.py` | ToolDef + ToolRegistry |
+| `src/agent/tools/auxia.py` | **Auxia Console BFF API (read-only treatments, surfaces, objectives)** |
 | `src/agent/tools/bigquery.py` | BigQuery query tool (SELECT only) |
 | `src/agent/tools/gcs.py` | GCS read/write (path-validated) |
-| `src/agent/tools/memory.py` | Memory search/store |
+| `src/agent/tools/memory.py` | Memory search (BM25) + categorized save |
 | `src/agent/tools/subagent.py` | Subagent spawning + fan-out |
 
 ### Infrastructure
 | Path | Purpose |
 |------|---------|
 | `flows/agent_flow.py` | Metaflow flow for GKE execution |
-| `configs/agent.yaml` | Agent configuration |
+| `configs/agent.yaml` | Agent configuration (project-agnostic) |
 | `src/bq_client.py` | BigQuery client wrapper |
 | `src/gcs_utils.py` | GCS utilities |
 | `src/config.py` | YAML config loader with env var substitution |
@@ -102,13 +112,24 @@ uv pip install -e ".[dev,agent]"
 - **Subagent model allowlist**: Only configured models can be used
 - **API retry**: Exponential backoff on rate limits, checkpoint on failure
 - **Temp file cleanup**: try/finally on all temp files
+- **Auxia Console**: Read-only access (Phase 1) — no write operations
 
 ## Design Decisions
 - See [docs/architecture/system_architecture.md](docs/architecture/system_architecture.md) for rationale
 - Plan-as-artifact pattern from Hightouch: plan stored as tool output, model can reference/revise
 - Subagent isolation from OpenClaw: child LLMs get scoped context, not full conversation
-- Hybrid memory (not SQLite-only): hot in-memory + warm GCS + cold BigQuery
-- Session compaction: summarize old turns, promote durable facts before truncating
+- Hybrid memory: hot in-memory + warm GCS JSONL + cold BigQuery BM25 search
+- Pre-compaction flush from OpenClaw: LLM extracts important findings before context truncation
+- Session isolation: trigger-based keys (cli/slack/cron) prevent cross-contamination
+- Multi-project: project context loaded dynamically from Auxia Console API
+- System prompt rules: anti-looping (2 retries), memory-first, plan-first, session summary
+
+## Memory System
+- **Categories**: finding, decision, pattern, session_summary, general
+- **Storage**: in-memory (hot) → GCS JSONL (warm) → BigQuery (cold)
+- **Search**: BM25 via BigQuery `SEARCH()` function, with hot-layer substring fallback
+- **GCS layout**: `gs://{bucket}/agent/memory/{project_id}/memories.jsonl`
+- **Pre-compaction**: LLM identifies important findings before context truncation
 
 ## Workflow: Plan → Code → Review
 
