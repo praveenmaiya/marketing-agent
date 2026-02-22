@@ -85,7 +85,12 @@ def build_agent(
     )
 
     # Wire up domain tools
-    orchestrator.add_tools(create_bigquery_tools(config.bigquery))
+    orchestrator.add_tools(create_bigquery_tools(
+        config.bigquery,
+        gcs_config=config.gcs,
+        session_id=session_key.session_id,
+        agent_behavior=config.agent,
+    ))
     orchestrator.add_tools(create_gcs_tools(config.gcs))
     orchestrator.add_tools(create_memory_tools(context))
     orchestrator.add_tools(create_subagent_tools(config))
