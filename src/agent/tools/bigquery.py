@@ -43,8 +43,10 @@ _WITH_OUTER_SELECT = re.compile(
 # (applied after stripping literals/comments to avoid false positives)
 _HAS_MULTI_STATEMENT = re.compile(r";\s*\S")
 
-# Patterns to strip literals/comments before semicolon check
+# Patterns to strip literals/comments/quoted identifiers before paren walking
 _STRING_LITERAL = re.compile(r"'(?:[^'\\]|\\.)*'")
+_DOUBLE_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
+_BACKTICK_QUOTED = re.compile(r'`[^`]*`')
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _LINE_COMMENT = re.compile(r"--[^\n]*")
 
@@ -63,8 +65,10 @@ _MAX_ROWS_UPPER = 1000
 
 
 def _strip_noise(sql: str) -> str:
-    """Strip string literals, block comments, and line comments from SQL."""
+    """Strip literals, quoted identifiers, and comments from SQL."""
     s = _STRING_LITERAL.sub("", sql)
+    s = _DOUBLE_QUOTED.sub("", s)
+    s = _BACKTICK_QUOTED.sub("", s)
     s = _BLOCK_COMMENT.sub("", s)
     s = _LINE_COMMENT.sub("", s)
     return s
@@ -77,19 +81,19 @@ def _is_safe_sql(sql: str) -> bool:
     - First keyword must be SELECT or WITH (after whitespace/comments)
     - WITH must lead to SELECT (not DELETE/UPDATE/INSERT/MERGE after CTEs)
     - No multi-statement scripts (semicolon followed by more SQL)
-    - Literals and comments are stripped before semicolon check
+    - Literals and comments are stripped before all checks to keep offsets consistent
     """
     stripped = _strip_noise(sql)
     if _HAS_MULTI_STATEMENT.search(stripped):
         return False
-    m = _ALLOWED_SQL_START.match(sql)
+    # Match on stripped (not original sql) so m.end() is valid for indexing stripped
+    m = _ALLOWED_SQL_START.match(stripped)
     if not m:
         return False
-    # If it starts with SELECT, it's safe
     if m.group(1).upper() == "SELECT":
         return True
     # WITH: verify the outer statement (after all CTEs) is SELECT.
-    # Walk the stripped SQL past balanced parentheses in CTE definitions.
+    # Walk past balanced parentheses in CTE definitions.
     after_with = stripped[m.end():]
     depth = 0
     i = 0
@@ -100,11 +104,18 @@ def _is_safe_sql(sql: str) -> bool:
         elif ch == ")":
             depth -= 1
             if depth == 0:
-                # Skip past optional comma for next CTE
                 rest = after_with[i + 1:].lstrip()
-                if rest.startswith(","):
+                # CTE column list: name(col1, ...) AS (...) — skip into the body
+                col_match = re.match(r'(?i)AS\s*\(', rest)
+                if col_match:
+                    ws = len(after_with[i + 1:]) - len(rest)
+                    paren_pos = i + 1 + ws + col_match.end() - 1
+                    depth = 1
+                    i = paren_pos + 1
+                    continue
+                # Comma separates CTEs — advance past it
+                elif rest.startswith(","):
                     i = after_with.index(",", i + 1) + 1
-                    # Continue scanning next CTE
                 else:
                     # This should be the final SELECT
                     return bool(_WITH_OUTER_SELECT.match(rest))

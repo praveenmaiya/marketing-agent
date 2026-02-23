@@ -196,6 +196,52 @@ class TestSQLAllowlist:
         sql = "WITH c AS (SELECT * FROM (SELECT 1)) SELECT * FROM c"
         assert _is_safe_sql(sql) is True
 
+    # Leading-comment offset regression tests (Codex round 4) ----------------
+
+    def test_with_leading_block_comment_select_allowed(self):
+        """WITH query with leading block comment should be allowed."""
+        assert _is_safe_sql("/*comment*/WITH cte AS (SELECT 1) SELECT * FROM cte") is True
+        assert _is_safe_sql("/* long padding */WITH c AS (SELECT 1) SELECT * FROM c") is True
+
+    def test_with_leading_block_comment_dml_blocked(self):
+        """WITH+DML must be blocked regardless of leading comment length."""
+        for n in (1, 12, 20, 50):
+            sql = f"/*{'a' * n}*/WITH c AS (SELECT 1) INSERT INTO t(x) SELECT 1"
+            assert _is_safe_sql(sql) is False, f"Failed for comment length {n}"
+
+    def test_with_leading_line_comment_select_allowed(self):
+        assert _is_safe_sql("-- comment\nWITH c AS (SELECT 1) SELECT * FROM c") is True
+
+    # CTE column-list tests (Codex round 4) ----------------------------------
+
+    def test_with_cte_column_list_allowed(self):
+        """WITH cte(col) AS (...) SELECT is valid SQL."""
+        assert _is_safe_sql("WITH cte(col) AS (SELECT 1) SELECT * FROM cte") is True
+
+    def test_with_multi_cte_column_lists_allowed(self):
+        sql = "WITH a(x) AS (SELECT 1), b(y) AS (SELECT 2) SELECT * FROM a, b"
+        assert _is_safe_sql(sql) is True
+
+    def test_with_cte_column_list_dml_blocked(self):
+        """WITH cte(col) AS (...) DELETE must still be blocked."""
+        assert _is_safe_sql("WITH c(x) AS (SELECT 1) DELETE FROM t") is False
+
+    # Quoted-identifier bypass tests (Codex round 5) -------------------------
+
+    def test_backtick_identifier_with_paren_dml_blocked(self):
+        """Backtick identifiers containing ) must not break paren walker."""
+        assert _is_safe_sql("WITH c AS (SELECT 1 AS `) SELECT`) DELETE FROM t") is False
+        assert _is_safe_sql("WITH c AS (SELECT 1 AS `) SELECT`) INSERT INTO t(x) SELECT 1") is False
+
+    def test_double_quoted_with_paren_dml_blocked(self):
+        """Double-quoted strings containing ) must not break paren walker."""
+        assert _is_safe_sql('WITH c AS (SELECT 1 AS ") SELECT") DELETE FROM t') is False
+
+    def test_backtick_identifier_select_allowed(self):
+        """Backtick identifiers in safe queries should still pass."""
+        assert _is_safe_sql("WITH `c` AS (SELECT 1) SELECT * FROM `c`") is True
+        assert _is_safe_sql("SELECT * FROM `my-project.dataset.table`") is True
+
 
 # ---------------------------------------------------------------------------
 # BigQuery context-buffering tests
