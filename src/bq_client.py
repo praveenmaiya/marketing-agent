@@ -3,7 +3,7 @@
 import logging
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import pandas as pd
 from google.cloud import bigquery
@@ -37,6 +37,7 @@ class BQClient:
         query: str,
         params: dict[str, Any] = None,
         dry_run: bool = False,
+        max_results: int | None = None,
     ) -> pd.DataFrame:
         """Run a SQL query.
 
@@ -44,6 +45,7 @@ class BQClient:
             query: SQL query string.
             params: Query parameters.
             dry_run: If True, only validate and estimate cost.
+            max_results: Max rows to fetch. None means no limit.
 
         Returns:
             Query results as DataFrame.
@@ -68,7 +70,7 @@ class BQClient:
             logger.info(f"Dry run: {bytes_processed / 1e9:.2f} GB estimated")
             return pd.DataFrame()
 
-        result = job.result()
+        result = job.result(max_results=max_results)
         df = result.to_dataframe()
 
         logger.info(f"Query returned {len(df)} rows")
@@ -142,12 +144,12 @@ class BQClient:
         query_params = []
 
         for name, value in params.items():
-            if isinstance(value, int):
+            if isinstance(value, bool):
+                param_type = "BOOL"
+            elif isinstance(value, int):
                 param_type = "INT64"
             elif isinstance(value, float):
                 param_type = "FLOAT64"
-            elif isinstance(value, bool):
-                param_type = "BOOL"
             else:
                 param_type = "STRING"
 

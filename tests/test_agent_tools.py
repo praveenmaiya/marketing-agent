@@ -6,7 +6,7 @@ import pandas as pd
 
 from src.agent.config import AgentBehaviorConfig, BigQueryConfig, GCSConfig
 from src.agent.tools import ToolDef, ToolRegistry
-from src.agent.tools.bigquery import create_bigquery_tools
+from src.agent.tools.bigquery import _MAX_MATERIALIZE_ROWS, _is_safe_sql, create_bigquery_tools
 
 
 class TestToolDef:
@@ -115,13 +115,99 @@ class TestToolRegistry:
 
 
 # ---------------------------------------------------------------------------
+# SQL allowlist tests
+# ---------------------------------------------------------------------------
+
+
+class TestSQLAllowlist:
+    """Tests for the _is_safe_sql allowlist guard."""
+
+    def test_select_allowed(self):
+        assert _is_safe_sql("SELECT * FROM table") is True
+
+    def test_select_with_leading_whitespace(self):
+        assert _is_safe_sql("  \n  SELECT 1") is True
+
+    def test_with_cte_allowed(self):
+        assert _is_safe_sql("WITH cte AS (SELECT 1) SELECT * FROM cte") is True
+
+    def test_select_with_comment(self):
+        assert _is_safe_sql("-- get users\nSELECT * FROM users") is True
+
+    def test_insert_blocked(self):
+        assert _is_safe_sql("INSERT INTO table VALUES (1)") is False
+
+    def test_drop_blocked(self):
+        assert _is_safe_sql("DROP TABLE users") is False
+
+    def test_delete_blocked(self):
+        assert _is_safe_sql("DELETE FROM users WHERE id=1") is False
+
+    def test_create_blocked(self):
+        assert _is_safe_sql("CREATE TABLE foo (id INT)") is False
+
+    def test_update_blocked(self):
+        assert _is_safe_sql("UPDATE users SET name='x'") is False
+
+    def test_multi_statement_blocked(self):
+        assert _is_safe_sql("SELECT 1; DROP TABLE users") is False
+
+    def test_trailing_semicolon_allowed(self):
+        # Trailing semicolon with only whitespace after is fine
+        assert _is_safe_sql("SELECT 1;") is True
+        assert _is_safe_sql("SELECT 1; ") is True
+
+    def test_semicolon_in_string_literal_allowed(self):
+        # Semicolons inside string literals should not trigger rejection
+        assert _is_safe_sql("SELECT ';' as s") is True
+        assert _is_safe_sql("SELECT '; DROP' as s") is True
+        assert _is_safe_sql("SELECT 'a; b'") is True
+
+    def test_semicolon_in_comment_allowed(self):
+        assert _is_safe_sql("SELECT 1 /* hi;there */") is True
+
+    def test_semicolon_in_line_comment_allowed(self):
+        # Semicolons inside -- line comments should not trigger rejection
+        assert _is_safe_sql("SELECT 1 -- hi;there") is True
+        assert _is_safe_sql("SELECT 1 -- hi;there\n") is True
+        assert _is_safe_sql("SELECT 1; -- finished statement") is True
+
+    def test_with_cte_then_delete_blocked(self):
+        # WITH ... DELETE bypasses naive allowlist — must be blocked
+        assert _is_safe_sql("WITH c AS (SELECT 1) DELETE FROM t WHERE id=1") is False
+
+    def test_with_cte_then_update_blocked(self):
+        assert _is_safe_sql("WITH c AS (SELECT 1) UPDATE t SET x=1") is False
+
+    def test_with_cte_then_insert_blocked(self):
+        assert _is_safe_sql("WITH c AS (SELECT 1) INSERT INTO t(x) SELECT 1") is False
+
+    def test_with_cte_then_merge_blocked(self):
+        assert _is_safe_sql(
+            "WITH c AS (SELECT 1) MERGE t USING c ON t.id=c.id "
+            "WHEN MATCHED THEN UPDATE SET x=1"
+        ) is False
+
+    def test_with_multiple_ctes_then_select_allowed(self):
+        sql = "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a JOIN b"
+        assert _is_safe_sql(sql) is True
+
+    def test_with_nested_parens_select_allowed(self):
+        sql = "WITH c AS (SELECT * FROM (SELECT 1)) SELECT * FROM c"
+        assert _is_safe_sql(sql) is True
+
+
+# ---------------------------------------------------------------------------
 # BigQuery context-buffering tests
 # ---------------------------------------------------------------------------
 
 
-def _make_df(n_rows: int) -> pd.DataFrame:
+def _make_df(n_rows: int, n_cols: int = 2) -> pd.DataFrame:
     """Helper: create a simple DataFrame with *n_rows* rows."""
-    return pd.DataFrame({"id": range(n_rows), "value": [f"v{i}" for i in range(n_rows)]})
+    data = {"id": range(n_rows), "value": [f"v{i}" for i in range(n_rows)]}
+    for c in range(2, n_cols):
+        data[f"col_{c}"] = [f"data_{i}_{c}" for i in range(n_rows)]
+    return pd.DataFrame(data)
 
 
 def _get_query_tool(tools: list[ToolDef]) -> ToolDef:
@@ -137,6 +223,16 @@ class TestBigQueryContextBuffering:
     session_id = "sess-001"
     agent_behavior = AgentBehaviorConfig(context_buffer_threshold=50)
 
+    def _make_tools(self, mock_make_client, mock_client, **kwargs):
+        """Helper to create tools with standard mocking."""
+        mock_make_client.return_value = mock_client
+        return create_bigquery_tools(
+            kwargs.get("bq_config", self.bq_config),
+            gcs_config=kwargs.get("gcs_config", self.gcs_config),
+            session_id=kwargs.get("session_id", self.session_id),
+            agent_behavior=kwargs.get("agent_behavior", self.agent_behavior),
+        )
+
     # 1. Small result: inline (existing behaviour) --------------------------
 
     @patch("src.agent.tools.bigquery._make_client")
@@ -144,14 +240,8 @@ class TestBigQueryContextBuffering:
         """Results with <= 50 rows stay inline as markdown."""
         mock_client = MagicMock()
         mock_client.run_query.return_value = _make_df(10)
-        mock_make_client.return_value = mock_client
 
-        tools = create_bigquery_tools(
-            self.bq_config,
-            gcs_config=self.gcs_config,
-            session_id=self.session_id,
-            agent_behavior=self.agent_behavior,
-        )
+        tools = self._make_tools(mock_make_client, mock_client)
         result = _get_query_tool(tools).handler({"sql": "SELECT 1"})
 
         assert "10 rows" in result
@@ -166,16 +256,9 @@ class TestBigQueryContextBuffering:
         """Results with > 50 rows are written to GCS; LLM sees preview + URI."""
         mock_client = MagicMock()
         mock_client.run_query.return_value = _make_df(100)
-        mock_make_client.return_value = mock_client
-
         mock_upload.return_value = "gs://my-bucket/agent/artifacts/query_sess-001_abc.csv"
 
-        tools = create_bigquery_tools(
-            self.bq_config,
-            gcs_config=self.gcs_config,
-            session_id=self.session_id,
-            agent_behavior=self.agent_behavior,
-        )
+        tools = self._make_tools(mock_make_client, mock_client)
         result = _get_query_tool(tools).handler({"sql": "SELECT 1"})
 
         assert "100 rows" in result
@@ -183,28 +266,21 @@ class TestBigQueryContextBuffering:
         assert "gs://" in result
         mock_upload.assert_called_once()
 
-    # 3. GCS failure: fall back to inline -----------------------------------
+    # 3. GCS failure: fall back to inline with warning ----------------------
 
     @patch("src.agent.tools.bigquery.upload_blob", side_effect=RuntimeError("boom"))
     @patch("src.agent.tools.bigquery._make_client")
-    def test_gcs_failure_falls_back_to_inline(self, mock_make_client, mock_upload):
-        """If GCS upload fails, the result is returned inline (no crash)."""
+    def test_gcs_failure_falls_back_to_inline_with_warning(self, mock_make_client, mock_upload):
+        """If GCS upload fails, result is returned inline with a WARNING prefix."""
         mock_client = MagicMock()
         mock_client.run_query.return_value = _make_df(100)
-        mock_make_client.return_value = mock_client
 
-        tools = create_bigquery_tools(
-            self.bq_config,
-            gcs_config=self.gcs_config,
-            session_id=self.session_id,
-            agent_behavior=self.agent_behavior,
-        )
+        tools = self._make_tools(mock_make_client, mock_client)
         result = _get_query_tool(tools).handler({"sql": "SELECT 1"})
 
-        # Should NOT mention GCS buffering — it fell back to inline
-        assert "buffered" not in result.lower()
+        assert "WARNING" in result
+        assert "GCS buffering failed" in result
         assert "100 rows" in result
-        # Should still render as markdown table
         assert "|" in result  # markdown table pipe chars
 
     # 4. Preview has at most 10 rows ----------------------------------------
@@ -216,16 +292,9 @@ class TestBigQueryContextBuffering:
         n = 200
         mock_client = MagicMock()
         mock_client.run_query.return_value = _make_df(n)
-        mock_make_client.return_value = mock_client
-
         mock_upload.return_value = "gs://my-bucket/agent/artifacts/query_sess-001_xyz.csv"
 
-        tools = create_bigquery_tools(
-            self.bq_config,
-            gcs_config=self.gcs_config,
-            session_id=self.session_id,
-            agent_behavior=self.agent_behavior,
-        )
+        tools = self._make_tools(mock_make_client, mock_client)
         result = _get_query_tool(tools).handler({"sql": "SELECT 1"})
 
         assert "200 rows" in result
@@ -237,3 +306,223 @@ class TestBigQueryContextBuffering:
         ]
         # header (1) + 10 data rows = 11 lines starting with "|"
         assert len(table_lines) == 11
+
+    # 5. Boundary: exactly 50 rows = inline, 51 = buffered -----------------
+
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_boundary_50_rows_stays_inline(self, mock_make_client):
+        """Exactly threshold rows should stay inline (not >)."""
+        mock_client = MagicMock()
+        mock_client.run_query.return_value = _make_df(50)
+
+        tools = self._make_tools(mock_make_client, mock_client)
+        result = _get_query_tool(tools).handler({"sql": "SELECT 1"})
+
+        assert "50 rows" in result
+        assert "buffered" not in result.lower()
+        assert "gs://" not in result
+
+    @patch("src.agent.tools.bigquery.upload_blob")
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_boundary_51_rows_gets_buffered(self, mock_make_client, mock_upload):
+        """One row above threshold triggers buffering."""
+        mock_client = MagicMock()
+        mock_client.run_query.return_value = _make_df(51)
+        mock_upload.return_value = "gs://my-bucket/agent/artifacts/query_sess-001_51.csv"
+
+        tools = self._make_tools(mock_make_client, mock_client)
+        result = _get_query_tool(tools).handler({"sql": "SELECT 1"})
+
+        assert "51 rows" in result
+        assert "buffered to GCS" in result
+        mock_upload.assert_called_once()
+
+    # 6. Buffering disabled without gcs_config ------------------------------
+
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_buffering_disabled_without_gcs_config(self, mock_make_client):
+        """Large results stay inline when gcs_config is not provided."""
+        mock_client = MagicMock()
+        mock_client.run_query.return_value = _make_df(100)
+        mock_make_client.return_value = mock_client
+
+        tools = create_bigquery_tools(
+            self.bq_config,
+            gcs_config=None,
+            session_id=None,
+            agent_behavior=self.agent_behavior,
+        )
+        result = _get_query_tool(tools).handler({"sql": "SELECT 1"})
+
+        assert "100 rows" in result
+        assert "buffered" not in result.lower()
+        assert "gs://" not in result
+
+    # 7. max_rows clamping --------------------------------------------------
+
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_max_rows_clamped_to_upper_bound(self, mock_make_client):
+        """max_rows > 1000 is clamped to 1000."""
+        mock_client = MagicMock()
+        mock_client.run_query.return_value = _make_df(30)
+        mock_make_client.return_value = mock_client
+
+        tools = create_bigquery_tools(
+            self.bq_config,
+            gcs_config=None,
+            session_id=None,
+            agent_behavior=self.agent_behavior,
+        )
+        # Should not crash with extreme values
+        result = _get_query_tool(tools).handler({"sql": "SELECT 1", "max_rows": 99999})
+        assert "30 rows" in result
+
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_max_rows_clamped_to_lower_bound(self, mock_make_client):
+        """max_rows < 1 is clamped to 1."""
+        mock_client = MagicMock()
+        mock_client.run_query.return_value = _make_df(5)
+        mock_make_client.return_value = mock_client
+
+        tools = create_bigquery_tools(
+            self.bq_config,
+            gcs_config=None,
+            session_id=None,
+            agent_behavior=self.agent_behavior,
+        )
+        result = _get_query_tool(tools).handler({"sql": "SELECT 1", "max_rows": -10})
+        assert "5 rows" in result
+
+    # 8. SQL allowlist integration test -------------------------------------
+
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_sql_allowlist_blocks_insert(self, mock_make_client):
+        """INSERT query is blocked by the allowlist guard."""
+        mock_client = MagicMock()
+        mock_make_client.return_value = mock_client
+
+        tools = create_bigquery_tools(self.bq_config)
+        result = _get_query_tool(tools).handler({"sql": "INSERT INTO t VALUES (1)"})
+
+        assert "ERROR" in result
+        mock_client.run_query.assert_not_called()
+
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_sql_allowlist_blocks_multi_statement(self, mock_make_client):
+        """Multi-statement query is blocked."""
+        mock_client = MagicMock()
+        mock_make_client.return_value = mock_client
+
+        tools = create_bigquery_tools(self.bq_config)
+        result = _get_query_tool(tools).handler({"sql": "SELECT 1; DROP TABLE users"})
+
+        assert "ERROR" in result
+        mock_client.run_query.assert_not_called()
+
+    # 9. max_results passed to BQ client ------------------------------------
+
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_max_results_passed_to_client(self, mock_make_client):
+        """run_query is called with max_results to cap memory usage."""
+        mock_client = MagicMock()
+        mock_client.run_query.return_value = _make_df(5)
+        mock_make_client.return_value = mock_client
+
+        tools = create_bigquery_tools(self.bq_config)
+        _get_query_tool(tools).handler({"sql": "SELECT 1"})
+
+        mock_client.run_query.assert_called_once_with(
+            "SELECT 1", max_results=_MAX_MATERIALIZE_ROWS + 1,
+        )
+
+    # 10. Dynamic threshold in tool description -----------------------------
+
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_description_uses_dynamic_threshold(self, mock_make_client):
+        """Tool description reflects the configured threshold, not hardcoded 50."""
+        mock_make_client.return_value = MagicMock()
+
+        custom_behavior = AgentBehaviorConfig(context_buffer_threshold=100)
+        tools = create_bigquery_tools(
+            self.bq_config,
+            agent_behavior=custom_behavior,
+        )
+        query_tool = _get_query_tool(tools)
+
+        assert "<=100" in query_tool.description
+        assert ">100" in query_tool.description
+
+    # 11. Artifact prefix from config ---------------------------------------
+
+    @patch("src.agent.tools.bigquery.upload_blob")
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_uses_config_artifact_prefix(self, mock_make_client, mock_upload):
+        """Blob path uses gcs_config.artifact_prefix, not hardcoded."""
+        mock_client = MagicMock()
+        mock_client.run_query.return_value = _make_df(100)
+        mock_upload.return_value = "gs://my-bucket/custom/prefix/query.csv"
+
+        custom_gcs = GCSConfig(bucket="my-bucket", artifact_prefix="custom/prefix/")
+
+        tools = self._make_tools(
+            mock_make_client, mock_client, gcs_config=custom_gcs,
+        )
+        _get_query_tool(tools).handler({"sql": "SELECT 1"})
+
+        # Verify upload_blob was called with a path starting with custom prefix
+        call_args = mock_upload.call_args
+        blob_name = call_args[0][2]  # 3rd positional arg is blob_name
+        assert blob_name.startswith("custom/prefix/")
+
+    # 12. Result cap note ---------------------------------------------------
+
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_result_cap_note_shown_when_capped(self, mock_make_client):
+        """When results exceed the cap, a note is shown and rows truncated."""
+        mock_client = MagicMock()
+        # Return one more than cap to trigger capping (sentinel approach)
+        mock_client.run_query.return_value = _make_df(_MAX_MATERIALIZE_ROWS + 1)
+        mock_make_client.return_value = mock_client
+
+        tools = create_bigquery_tools(
+            self.bq_config, gcs_config=None, session_id=None,
+        )
+        result = _get_query_tool(tools).handler({"sql": "SELECT 1"})
+
+        assert "capped at" in result.lower()
+        assert "LIMIT" in result
+        # Row count in output should be the cap, not cap+1
+        assert f"{_MAX_MATERIALIZE_ROWS} rows" in result
+
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_exact_cap_no_false_positive(self, mock_make_client):
+        """Exactly max rows should NOT show cap note (sentinel detects no overflow)."""
+        mock_client = MagicMock()
+        mock_client.run_query.return_value = _make_df(_MAX_MATERIALIZE_ROWS)
+        mock_make_client.return_value = mock_client
+
+        tools = create_bigquery_tools(
+            self.bq_config, gcs_config=None, session_id=None,
+        )
+        result = _get_query_tool(tools).handler({"sql": "SELECT 1"})
+
+        assert "capped" not in result.lower()
+
+    # 13. Inline output gets char-budget truncation ---------------------------
+
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_inline_output_truncated_for_wide_data(self, mock_make_client):
+        """Inline markdown output is truncated when it exceeds char budget."""
+        mock_client = MagicMock()
+        # Create a DF with very wide text columns to exceed 4000 chars
+        mock_client.run_query.return_value = _make_df(10, n_cols=20)
+        mock_make_client.return_value = mock_client
+
+        tools = create_bigquery_tools(
+            self.bq_config, gcs_config=None, session_id=None,
+            agent_behavior=self.agent_behavior,
+        )
+        result = _get_query_tool(tools).handler({"sql": "SELECT 1"})
+
+        # Result should still be present but not excessively long
+        assert "10 rows" in result
