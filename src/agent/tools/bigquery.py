@@ -44,9 +44,9 @@ _WITH_OUTER_SELECT = re.compile(
 _HAS_MULTI_STATEMENT = re.compile(r";\s*\S")
 
 # Patterns to strip literals/comments/quoted identifiers before paren walking
-_STRING_LITERAL = re.compile(r"'(?:[^'\\]|\\.)*'")
+_STRING_LITERAL = re.compile(r"'(?:[^'\\]|\\.|'')*'")
 _DOUBLE_QUOTED = re.compile(r'"(?:[^"\\]|\\.)*"')
-_BACKTICK_QUOTED = re.compile(r'`[^`]*`')
+_BACKTICK_QUOTED = re.compile(r'`(?:[^`\\]|\\.)*`')
 _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _LINE_COMMENT = re.compile(r"--[^\n]*")
 
@@ -150,6 +150,9 @@ def _buffer_to_gcs(
         df.to_csv(tmp_path, index=False)
         uri = upload_blob(tmp_path, bucket, blob_name)
         return uri
+    except (PermissionError, ValueError):
+        # Hard failures (auth/config) should propagate — not silently degrade
+        raise
     except Exception:
         logger.warning("GCS buffering failed — falling back to inline", exc_info=True)
         return None

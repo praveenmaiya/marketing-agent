@@ -6,7 +6,13 @@ import pandas as pd
 
 from src.agent.config import AgentBehaviorConfig, BigQueryConfig, GCSConfig
 from src.agent.tools import ToolDef, ToolRegistry
-from src.agent.tools.bigquery import _MAX_MATERIALIZE_ROWS, _is_safe_sql, create_bigquery_tools
+from src.agent.tools.bigquery import (
+    _MAX_MATERIALIZE_ROWS,
+    _PREVIEW_MAX_CHARS,
+    _is_safe_sql,
+    _truncate_preview,
+    create_bigquery_tools,
+)
 
 
 class TestToolDef:
@@ -242,6 +248,18 @@ class TestSQLAllowlist:
         assert _is_safe_sql("WITH `c` AS (SELECT 1) SELECT * FROM `c`") is True
         assert _is_safe_sql("SELECT * FROM `my-project.dataset.table`") is True
 
+    # Escaped-backtick bypass tests (Codex round 6) ----------------------------
+
+    def test_escaped_backtick_dml_blocked(self):
+        r"""Escaped backtick \` inside identifier must not break paren walker."""
+        assert _is_safe_sql(r"WITH c AS (SELECT 1 AS `x\`) SELECT`) DELETE FROM t") is False
+        assert _is_safe_sql(r"WITH c AS (SELECT 1 AS `x\`) SELECT`) INSERT INTO t(x) SELECT 1") is False
+
+    def test_escaped_backtick_select_allowed(self):
+        r"""Escaped backtick in safe query should still pass."""
+        assert _is_safe_sql(r"WITH c AS (SELECT 1 AS `abc\`def`) SELECT * FROM c") is True
+        assert _is_safe_sql(r"SELECT * FROM `my\`table`") is True
+
 
 # ---------------------------------------------------------------------------
 # BigQuery context-buffering tests
@@ -328,6 +346,34 @@ class TestBigQueryContextBuffering:
         assert "GCS buffering failed" in result
         assert "100 rows" in result
         assert "|" in result  # markdown table pipe chars
+
+    # 3b. Hard GCS errors propagate (not silently swallowed) ----------------
+
+    @patch("src.agent.tools.bigquery.upload_blob", side_effect=PermissionError("403"))
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_permission_error_propagates(self, mock_make_client, mock_upload):
+        """PermissionError from GCS upload must propagate — not degrade to inline."""
+        import pytest
+
+        mock_client = MagicMock()
+        mock_client.run_query.return_value = _make_df(100)
+
+        tools = self._make_tools(mock_make_client, mock_client)
+        with pytest.raises(PermissionError, match="403"):
+            _get_query_tool(tools).handler({"sql": "SELECT 1"})
+
+    @patch("src.agent.tools.bigquery.upload_blob", side_effect=ValueError("bad bucket"))
+    @patch("src.agent.tools.bigquery._make_client")
+    def test_value_error_propagates(self, mock_make_client, mock_upload):
+        """ValueError from GCS upload must propagate — not degrade to inline."""
+        import pytest
+
+        mock_client = MagicMock()
+        mock_client.run_query.return_value = _make_df(100)
+
+        tools = self._make_tools(mock_make_client, mock_client)
+        with pytest.raises(ValueError, match="bad bucket"):
+            _get_query_tool(tools).handler({"sql": "SELECT 1"})
 
     # 4. Preview has at most 10 rows ----------------------------------------
 
@@ -560,8 +606,12 @@ class TestBigQueryContextBuffering:
     def test_inline_output_truncated_for_wide_data(self, mock_make_client):
         """Inline markdown output is truncated when it exceeds char budget."""
         mock_client = MagicMock()
-        # Create a DF with very wide text columns to exceed 4000 chars
-        mock_client.run_query.return_value = _make_df(10, n_cols=20)
+        # Build a DF with long string values that will exceed _PREVIEW_MAX_CHARS
+        wide_data = {
+            f"col_{c}": [f"{'x' * 200}_{i}" for i in range(10)]
+            for c in range(10)
+        }
+        mock_client.run_query.return_value = pd.DataFrame(wide_data)
         mock_make_client.return_value = mock_client
 
         tools = create_bigquery_tools(
@@ -570,5 +620,19 @@ class TestBigQueryContextBuffering:
         )
         result = _get_query_tool(tools).handler({"sql": "SELECT 1"})
 
-        # Result should still be present but not excessively long
         assert "10 rows" in result
+        assert "... (preview truncated)" in result
+
+    # 14. Direct unit test for _truncate_preview ---------------------------------
+
+    def test_truncate_preview_short_unchanged(self):
+        """Short markdown passes through unchanged."""
+        short = "| a | b |\n|---|---|\n| 1 | 2 |"
+        assert _truncate_preview(short) == short
+
+    def test_truncate_preview_long_gets_marker(self):
+        """Markdown exceeding budget is cut and gets the truncation marker."""
+        long_md = "x" * (_PREVIEW_MAX_CHARS + 500)
+        result = _truncate_preview(long_md)
+        assert result.endswith("... (preview truncated)")
+        assert len(result) < len(long_md)
